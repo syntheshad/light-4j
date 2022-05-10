@@ -44,7 +44,11 @@ import io.undertow.Undertow;
 import io.undertow.UndertowMessages;
 import io.undertow.UndertowOptions;
 import io.undertow.client.*;
+import io.undertow.client.http2.Http2ClientConnection;
+import io.undertow.client.http2.Http2ClientProvider;
 import io.undertow.connector.ByteBufferPool;
+import io.undertow.protocols.http2.Http2Channel;
+import io.undertow.protocols.http2.Http2StreamSourceChannel;
 import io.undertow.protocols.ssl.UndertowXnioSsl;
 import io.undertow.server.DefaultByteBufferPool;
 import io.undertow.server.HttpServerExchange;
@@ -54,12 +58,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xnio.*;
 import org.xnio.channels.StreamSinkChannel;
+import org.xnio.http.HttpUpgrade;
+import org.xnio.ssl.SslConnection;
 import org.xnio.ssl.XnioSsl;
 
 import javax.net.ssl.*;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Constructor;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -284,16 +291,21 @@ public class Http2Client {
         if ("https".equals(uri.getScheme()) && ssl == null) ssl = getDefaultXnioSsl();
         if ("https".equals(proxyUri.getScheme()) && proxySsl == null) proxySsl = getDefaultXnioSsl();
 
-        UndertowClient.getInstance().connect(new ClientCallback<>() {
+        final Map<String, List<String>> headers = new HashMap<>();
+        headers.put(Headers.HOST_STRING, Collections.singletonList(uri.getHost() + ":" + uri.getPort()));
+
+        Http2Client.getInstance().connect(new ClientCallback<>() {
             @Override
             public void completed(ClientConnection clientConnection) {
                 try {
+
                     int port = uri.getPort() > 0 ? uri.getPort() : isSecure(uri) ? 443 : 80;
                     ClientRequest request = new ClientRequest()
                             .setMethod(Methods.CONNECT)
                             .setPath(uri.getHost() + ":" + port)
                             .setProtocol(Protocols.HTTP_1_1);
                     request.getRequestHeaders().put(Headers.HOST, proxyUri.getHost() + ":" + (proxyUri.getPort() > 0 ? proxyUri.getPort() : 80));
+
                     clientConnection.sendRequest(request, new ClientCallback<>() {
                         @Override
                         public void completed(ClientExchange clientExchange) {
@@ -302,8 +314,18 @@ public class Http2Client {
                                 public void completed(ClientExchange clientExchange) {
                                     try {
                                         if (clientExchange.getResponse().getResponseCode() == 200) {
-                                            result.setResult(clientConnection);
-                                            http2ClientConnectionPool.cacheConnection(uri, clientConnection);
+                                            // CONNECT method is treated like UPGRADE_REQUESTED state, so we need to perform upgrade before passing back
+                                            try {
+                                                clientConnection.performUpgrade();
+                                                if(isSecure(uri)) {
+
+                                                } else {
+
+                                                }
+                                            } catch (IOException e) {
+                                                result.setException(e);
+                                            }
+
                                         } else {
                                             result.setException(UndertowMessages.MESSAGES.proxyConnectionFailed(clientExchange.getResponse().getResponseCode()));
                                         }
@@ -311,6 +333,13 @@ public class Http2Client {
                                         result.setException(new IOException(e));
                                     }
                                 }
+
+                                private void passExistingConnection(StreamConnection target) {
+                                    final IoFuture<?> result;
+                                    result = HttpUpgrade.performUpgrade(target, uri, headers, createListener(), null );
+                                }
+
+
 
                                 @Override
                                 public void failed(IOException e) {
@@ -460,6 +489,57 @@ public class Http2Client {
 
     public static Http2Client getInstance(final ClassLoader classLoader) {
         return new Http2Client(classLoader);
+    }
+
+    private ChannelListener<StreamConnection> createListener(final StreamConnection streamConnection, final ClientCallback<ClientConnection> listener, final ByteBufferPool bufferPool, final OptionMap options) {
+        return new ChannelListener<StreamConnection>() {
+            @Override
+            public void handleEvent(StreamConnection connection) {
+                handleConnected(connection, listener, bufferPool, options);
+            }
+        };
+    }
+
+    private void handleConnected(final StreamConnection streamConnection, final ClientCallback<ClientConnection> listener, final ByteBufferPool bufferPool, final OptionMap options) {
+        boolean h2 = options.get(UndertowOptions.ENABLE_HTTP2, false);
+        if(streamConnection instanceof SslConnection && (h2)) {
+            List<ALPNClientSelector.ALPNProtocol> protocolList = new ArrayList<>();
+            if(h2) {
+                protocolList.add(Http2ClientProvider.alpnProtocol(listener, uri, bufferPool, options));
+            }
+
+            ALPNClientSelector.runAlpn((SslConnection) streamConnection, new ChannelListener<SslConnection>() {
+                @Override
+                public void handleEvent(SslConnection connection) {
+                    listener.completed(createHttpClientConnection(streamConnection, options, bufferPool));
+                }
+            }, listener, protocolList.toArray(new ALPNClientSelector.ALPNProtocol[protocolList.size()]));
+        } else {
+            if(streamConnection instanceof SslConnection) {
+                try {
+                    ((SslConnection) streamConnection).startHandshake();
+                } catch (Throwable t) {
+                    listener.failed((t instanceof IOException) ? (IOException) t : new IOException(t));
+                }
+            }
+            listener.completed(createHttpClientConnection(streamConnection, options, bufferPool));
+        }
+    }
+
+    private ClientConnection createHttpClientConnection(final StreamConnection connection, final OptionMap options, final ByteBufferPool bufferPool) {
+        try {
+            Class<?> cls = Class.forName("io.undertow.client.http.HttpClientConnection");
+
+            Constructor<?> o = cls.getDeclaredConstructor(StreamConnection.class, OptionMap.class, ByteBufferPool.class);
+
+            o.setAccessible(true);
+
+            return (ClientConnection) o.newInstance(connection, options, bufferPool);
+        }catch(Exception e) {
+            logger.error(e.getMessage(), e);
+        }
+
+        return null;
     }
 
 
@@ -1213,6 +1293,26 @@ public class Http2Client {
     private void addHostHeader(ClientRequest request) {
         if (!request.getRequestHeaders().contains(Headers.HOST)) {
             request.getRequestHeaders().put(Headers.HOST, "localhost");
+        }
+    }
+
+    private class Http2ConnectionListener implements ChannelListener<StreamConnection> {
+        private final OptionMap options;
+        private final ByteBufferPool bufferPool;
+        private final FutureResult<ClientConnection> result;
+        private final String defaultHost;
+
+        Http2ConnectionListener(ByteBufferPool bufferPool, OptionMap options, FutureResult<ClientConnection> result, String defaultHost) {
+            this.options = options;
+            this.bufferPool = bufferPool;
+            this.result = result;
+            this.defaultHost = defaultHost;
+        }
+
+        @Override
+        public void handleEvent(StreamConnection target) {
+            Http2Channel http2Channel = new Http2Channel(target, null, bufferPool, null, true, true, options);
+            Http2ClientConnection http2ClientConnection
         }
     }
 }
