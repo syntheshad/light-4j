@@ -15,3 +15,8 @@ pathHostMappings: ${externalService.pathHostMappings:}
 # with a space. For details, please refer to the light-router router.yml configuration.
 # Test your rules at https://www.freeformatter.com/java-regex-tester.html
 urlRewriteRules: ${externalService.urlRewriteRules:}
+# For some external service providers, they do not send the certificate, use expired certificate and self-signed
+# certificate, we need to bypass the certificate for those endpoints to use a customized trust all SSLContext.
+# This is not recommended for production; however, it can be used as a workaround if security team approves it.
+# The path prefixes listed below will use a customized trust all SSLContext for external access.
+trustAllCertsPathPrefixes: ${externalService.trustAllCertsPathPrefixes:}

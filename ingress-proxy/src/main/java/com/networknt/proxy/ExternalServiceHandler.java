@@ -18,6 +18,9 @@ import io.undertow.util.HttpString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.net.InetSocketAddress;
 import java.net.ProxySelector;
 import java.net.URI;
@@ -26,6 +29,10 @@ import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +53,7 @@ public class ExternalServiceHandler implements MiddlewareHandler {
     private volatile HttpHandler next;
     private ExternalServiceConfig config;
     private HttpClient client;
+    private HttpClient unsecureClient;
 
     public ExternalServiceHandler() {
         config = new ExternalServiceConfig();
@@ -165,7 +173,35 @@ public class ExternalServiceHandler implements MiddlewareHandler {
                         }
                     }
 
-                    HttpResponse<byte[]> response  = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                    if(unsecureClient == null) {
+                        try {
+                            HttpClient.Builder clientBuilder = HttpClient.newBuilder()
+                                    .followRedirects(HttpClient.Redirect.NORMAL)
+                                    .connectTimeout(Duration.ofMillis(ClientConfig.get().getTimeout()))
+                                    .sslContext(createTrustAllContext());
+                            if(config.getProxyHost() != null) clientBuilder.proxy(ProxySelector.of(new InetSocketAddress(config.getProxyHost(), config.getProxyPort() == 0 ? 443 : config.getProxyPort())));
+                            if(config.isEnableHttp2()) clientBuilder.version(HttpClient.Version.HTTP_2);
+                            // this a workaround to bypass the hostname verification in jdk11 http client.
+                            Map<String, Object> tlsMap = (Map<String, Object>)ClientConfig.get().getMappedConfig().get(Http2Client.TLS);
+                            final Properties props = System.getProperties();
+                            props.setProperty("jdk.httpclient.allowRestrictedHeaders", "Host");
+                            props.setProperty("jdk.httpclient.allowRestrictedHeaders", "Connection");
+                            if(tlsMap != null && !Boolean.TRUE.equals(tlsMap.get(TLSConfig.VERIFY_HOSTNAME))) {
+                                props.setProperty("jdk.internal.httpclient.disableHostnameVerification", Boolean.TRUE.toString());
+                            }
+                            client = clientBuilder.build();
+                        } catch (Exception e) {
+                            logger.error("Cannot create HttpClient:", e);
+                            throw e;
+                        }
+                    }
+                    boolean isUnSecureClient = config.getTrustAllCertsPathPrefixes() == null || config.getTrustAllCertsPathPrefixes().stream().anyMatch(requestPath::startsWith);
+                    HttpResponse<byte[]> response = null;
+                    if(isUnSecureClient) {
+                        response  = unsecureClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                    } else {
+                        response  = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                    }
                     HttpHeaders responseHeaders = response.headers();
                     byte[] responseBody = response.body();
                     exchange.setStatusCode(response.statusCode());
@@ -200,5 +236,25 @@ public class ExternalServiceHandler implements MiddlewareHandler {
             }
             f = headerMap.fiNextNonEmpty(f);
         }
+    }
+
+    private SSLContext createTrustAllContext() throws NoSuchAlgorithmException, KeyManagementException {
+        // set up a TrustManager that trusts everything. please don't use for production.
+        SSLContext sslContext = SSLContext.getInstance("SSL");
+        sslContext.init(null, new TrustManager[]{new X509TrustManager() {
+            public X509Certificate[] getAcceptedIssuers() {
+                if(logger.isTraceEnabled()) logger.trace("getAcceptedIssuers is called.");
+                return null;
+            }
+
+            public void checkClientTrusted(X509Certificate[] certs, String authType) {
+                if(logger.isTraceEnabled()) logger.trace("checkClientTrusted is called.");
+            }
+
+            public void checkServerTrusted(X509Certificate[] certs, String authType) {
+                if(logger.isTraceEnabled()) logger.trace("checkServerTrusted is called.");
+            }
+        }}, new SecureRandom());
+        return sslContext;
     }
 }
