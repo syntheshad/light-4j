@@ -19,11 +19,14 @@ package com.networknt.consul.client;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.networknt.client.ClientConfig;
 import com.networknt.client.Http2Client;
+import com.networknt.client.simplepool.SimpleConnectionHolder;
+import com.networknt.client.simplepool.SimpleConnectionMaker;
+import com.networknt.client.simplepool.SimpleURIConnectionPool;
+import com.networknt.client.simplepool.undertow.SimpleClientConnectionMaker;
 import com.networknt.config.Config;
 import com.networknt.consul.*;
 import com.networknt.httpstring.HttpStringConstants;
 import com.networknt.utility.StringUtils;
-import io.undertow.UndertowOptions;
 import io.undertow.client.ClientConnection;
 import io.undertow.client.ClientRequest;
 import io.undertow.client.ClientResponse;
@@ -33,7 +36,6 @@ import io.undertow.util.Methods;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xnio.IoUtils;
-import org.xnio.OptionMap;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -43,13 +45,6 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-
-// use SimpleURIConnectionPool as the connection pool
-import com.networknt.client.simplepool.SimpleURIConnectionPool;
-import com.networknt.client.simplepool.SimpleConnectionHolder;
-// Use Undertow ClientConnection as raw connection
-import com.networknt.client.simplepool.SimpleConnectionMaker;
-import com.networknt.client.simplepool.undertow.SimpleClientConnectionMaker;
 
 /**
  * A client that talks to Consul agent with REST API.
@@ -63,7 +58,6 @@ public class ConsulClientImpl implements ConsulClient {
 	private static final int UNUSUAL_STATUS_CODE = 300;
 	private Http2Client client = Http2Client.getInstance();
 
-	private OptionMap optionMap;
 	private URI uri;
 	private String wait = "600s";
 	private String timeoutBuffer = "5s";
@@ -77,7 +71,6 @@ public class ConsulClientImpl implements ConsulClient {
 	 */
 	public ConsulClientImpl() {
 		String consulUrl = config.getConsulUrl().toLowerCase();
-		optionMap =  isHttp2() ? OptionMap.create(UndertowOptions.ENABLE_HTTP2, true) : OptionMap.EMPTY;
 		logger.debug("Consul URL = {}", consulUrl);
 		if(config.getWait() != null && config.getWait().length() > 2) wait = config.getWait();
 		logger.debug("wait = {}", wait);
