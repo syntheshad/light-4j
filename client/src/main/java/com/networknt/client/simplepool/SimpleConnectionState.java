@@ -275,7 +275,7 @@ public final class SimpleConnectionState {
     /***
      * This method immediately expires the connection
      */
-    public synchronized void forceExpire() {
+    public void forceExpire() {
         EXPIRE_TIME = -1L;
     }
 
